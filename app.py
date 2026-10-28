@@ -11,10 +11,12 @@ Run:  streamlit run app.py
 from __future__ import annotations
 
 import base64
-import io
+import os
 import re
+import smtplib
 import time
 import urllib.parse
+from email.message import EmailMessage
 from datetime import date
 from pathlib import Path
 
@@ -378,7 +380,7 @@ st.html(f"<script>{js}</script>", unsafe_allow_javascript=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Photo (assets/photo.* > uploaded in sidebar > online avatar stand-in)
+#  Photo (assets/photo.* > online avatar stand-in)
 # ─────────────────────────────────────────────────────────────────────────────
 SILHOUETTE = "data:image/svg+xml;utf8," + urllib.parse.quote(
     "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 400 500'><rect width='400' height='500' fill='#1a1a26'/>"
@@ -392,14 +394,12 @@ def photo_source() -> tuple[str, bool]:
         p = ASSETS / f"photo.{ext}"
         if p.exists():
             return f"data:image/{ext.replace('jpg', 'jpeg')};base64," + base64.b64encode(p.read_bytes()).decode(), True
-    if ss.get("photo_b64"):
-        return ss.photo_b64, True
     return AVATAR, False
 
 
 def photo_html(compact: bool = False) -> str:
     src, real = photo_source()
-    tag = "Joseph Xeno · portrait" if real else "Stand-in avatar · swap in your photo"
+    tag = "Joseph Xeno · portrait" if real else "Stand-in avatar"
     seal = "" if compact else f'<div class="seal">CS<br>{date.today().year}</div>'
     return (
         f'<div class="x-photo"><div class="img" style="background-image:url(\'{src}\'),url(\'{SILHOUETTE}\')"></div>'
@@ -479,17 +479,6 @@ with st.sidebar:
         key="calm",
         help="Turns off the moving background, cursor ring, card tilt and animations. The content stays identical.",
     )
-    with st.expander("Swap in your photo", icon=":material/add_a_photo:"):
-        up = st.file_uploader("Upload a portrait", type=["png", "jpg", "jpeg", "webp"], label_visibility="collapsed")
-        if up is not None:
-            from PIL import Image
-
-            img = Image.open(up).convert("RGB")
-            img.thumbnail((700, 875))
-            buf = io.BytesIO()
-            img.save(buf, "JPEG", quality=86)
-            ss.photo_b64 = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
-            st.caption("Applied for this session. To make it permanent, save the file as `assets/photo.jpg`.")
     st.divider()
 
     resume_path = ASSETS / "Resume.docx"
@@ -858,81 +847,186 @@ def honors() -> None:
 # ═════════════════════════════════════════════════════════════════════════════
 #  FINAL ROUND — CONTACT
 # ═════════════════════════════════════════════════════════════════════════════
+CF_TEXT_KEYS = ("cf_name", "cf_mail", "cf_body")
+CF_COOLDOWN_S = 20
+
+
+def smtp_settings() -> dict | None:
+    """Mail credentials come from .streamlit/secrets.toml ([smtp]) or environment variables."""
+    conf: dict = {}
+    try:
+        conf = dict(st.secrets.get("smtp", {}))
+    except Exception:
+        conf = {}
+    user = conf.get("user") or os.environ.get("SMTP_USER")
+    password = conf.get("password") or os.environ.get("SMTP_PASSWORD")
+    if not user or not password:
+        return None
+    return {
+        "user": user,
+        "password": str(password).replace(" ", ""),
+        "host": conf.get("host") or os.environ.get("SMTP_HOST", "smtp.gmail.com"),
+        "port": int(conf.get("port") or os.environ.get("SMTP_PORT", 465)),
+        "to": conf.get("to") or os.environ.get("SMTP_TO") or EMAIL,
+    }
+
+
+def send_contact_email(m: dict) -> None:
+    cfg = smtp_settings()
+    if cfg is None:
+        raise RuntimeError("not-configured")
+    clean = lambda t: re.sub(r"[\r\n]+", " ", t).strip()  # no header injection
+    msg = EmailMessage()
+    msg["Subject"] = f"[Portfolio] {clean(m['topic'])} — from {clean(m['who'])}"
+    msg["From"] = f"Portfolio contact form <{cfg['user']}>"
+    msg["To"] = cfg["to"]
+    msg["Reply-To"] = f"{clean(m['who'])} <{clean(m['mail'])}>"
+    msg.set_content(
+        f"{m['body']}\n\n—\nFrom: {m['who']} <{m['mail']}>\n"
+        f"Topic: {m['topic']}\nPrefers reply via: {m['reply']}\nReply speed: {m['speed']}\n"
+    )
+    with smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=20) as server:
+        server.login(cfg["user"], cfg["password"])
+        server.send_message(msg)
+
+
+def submit_contact() -> None:
+    """Form callback: runs before the rerun, so it may reset widget values."""
+    who, mail, body = ss.cf_name.strip(), ss.cf_mail.strip(), ss.cf_body.strip()
+    problems: list[str] = []
+    if not who:
+        problems.append("Your name is missing.")
+    if "@" not in mail or "." not in mail.split("@")[-1] or " " in mail:
+        problems.append("That email address doesn't look valid.")
+        ss.cf_mail = ""  # clear only the box that failed
+    if len(body) < 10:
+        problems.append("Your message needs at least 10 characters.")
+        ss.cf_body = ""
+    if not ss.cf_ok:
+        problems.append("Please tick the box that lets me reply to you.")
+    if not problems and time.time() - ss.get("cf_last_sent", 0) < CF_COOLDOWN_S:
+        problems.append("You just sent a message — please wait a few seconds before sending another.")
+    if problems:
+        ss.contact_error = {"title": "Message not sent", "lead": "Here's what went wrong:", "items": problems}
+        return
+    ss.contact_pending = {
+        "who": who, "mail": mail, "topic": ss.cf_topic, "reply": ss.cf_reply,
+        "speed": ss.cf_speed, "body": body, "ok": ss.cf_ok,
+    }
+    for k in CF_TEXT_KEYS:
+        ss[k] = ""
+    ss.cf_ok = False
+    for k in ("cf_topic", "cf_reply", "cf_speed"):
+        ss.pop(k, None)
+
+
+@st.dialog("Message not sent")
+def contact_error_dialog(err: dict) -> None:
+    items = "".join(f"<li>{i}</li>" for i in err["items"])
+    st.html(
+        '<div style="text-align:center;padding:.2rem 0 .6rem">'
+        f'<div style="margin-bottom:.6rem">{ic("warning-circle", "ff5a73", "")}</div>'
+        f'<div style="font:700 1.05rem var(--body);color:var(--paper);margin-bottom:.6rem">{err["lead"]}</div>'
+        f'<ul style="list-style:none;padding:0;margin:0;font:500 .95rem var(--body);color:var(--paper);line-height:1.7">{items}</ul>'
+        "</div>"
+    )
+    if err.get("note"):
+        st.caption(err["note"])
+    if st.button("Got it", type="primary", width="stretch"):
+        st.rerun()
+
+
 def contact() -> None:
     round_banner("contact", "FINAL ROUND", "Let's talk", "Collaboration, internships, questions about a project, or feedback on this site — send a message below.")
-    left, right = st.columns([1.3, 1], gap="large")
-    with left:
-        with st.form("contact_form", clear_on_submit=True, border=True):
-            c1, c2 = st.columns(2)
-            who = c1.text_input("Your name *", placeholder="Ada Lovelace")
-            mail = c2.text_input("Your email *", placeholder="you@example.com")
-            topic = st.selectbox("What's this about?", ["Say hi", "Collaboration / project", "Internship or job", "Feedback on this site", "Question about my work"])
-            c3, c4 = st.columns(2)
-            reply = c3.radio("Best way to reply", ["Email", "LinkedIn"], horizontal=True)
-            speed = c4.select_slider("How soon?", ["Whenever", "This week", "Soon", "Urgent"], value="This week")
-            body = st.text_area("Message *", height=150, placeholder="What would you like to talk about?")
-            ok = st.checkbox("It's fine to reply using the details above")
-            sent = st.form_submit_button("Send message", type="primary", icon=":material/send:")
-        if sent:
-            problems = []
-            if not who.strip():
-                problems.append("your name")
-            if "@" not in mail or "." not in mail.split("@")[-1]:
-                problems.append("a valid email")
-            if len(body.strip()) < 10:
-                problems.append("a message (10+ characters)")
-            if not ok:
-                problems.append("permission to reply")
-            if problems:
-                st.error("Almost there — still needed: " + ", ".join(problems) + ".", icon=":material/error:")
-            else:
-                with st.status("Preparing your message…", expanded=True) as status:
-                    st.write("Checking the details")
-                    time.sleep(0.45)
-                    st.write("Packaging it for email")
-                    time.sleep(0.45)
-                    status.update(label="Message ready", state="complete", expanded=False)
-                ss.messages.append({"who": who.strip(), "mail": mail.strip(), "topic": topic, "reply": reply, "speed": speed, "body": body.strip()})
-                st.toast("Message prepared — one last click to send it.", icon=":material/mark_email_read:")
-                st.balloons()
-        if ss.messages:
-            m = ss.messages[-1]
-            subject = f"[Portfolio] {m['topic']} — from {m['who']}"
-            text = f"{m['body']}\n\n— {m['who']} ({m['mail']})\nPrefers: {m['reply']} · Reply speed: {m['speed']}"
-            link = f"mailto:{EMAIL}?subject={urllib.parse.quote(subject)}&body={urllib.parse.quote(text)}"
-            with st.container(border=True, key="card-receipt"):
-                st.markdown(f"##### Thanks, {m['who'].split()[0]}!")
-                st.caption(f"Topic: {m['topic']} · Reply via {m['reply']} · Speed: {m['speed']}")
-                st.markdown("> " + m["body"].replace("\n", "\n> "))
-                st.link_button("Open in my email app to send", link, icon=":material/outgoing_mail:", type="primary")
-                st.caption("This site has no server-side inbox, so the button above hands the message to your email app.")
-    with right:
-        for icon, title, sub, href in [
-            ("envelope-simple", "Email", EMAIL, f"mailto:{EMAIL}"),
-            ("linkedin-logo", "LinkedIn", "in/josephxeno", LINKEDIN),
-            ("github-logo", "GitHub", "X3N0Xeno", GITHUB),
-        ]:
-            st.html(
-                f'<a href="{href}" target="_blank" style="text-decoration:none"><div class="x-card x-tilt x-hot" style="display:flex;align-items:center;gap:1rem;margin-bottom:.8rem">'
-                f'<div style="width:46px;height:46px;border-radius:12px;display:grid;place-items:center;background:rgba(var(--accent-rgb),.14);border:1px solid rgba(var(--accent-rgb),.5)">'
-                f'{ic(icon, ACCENT_HEX.lstrip("#"), "")}</div>'
-                f'<div><div style="font:700 .98rem var(--body);color:var(--paper)">{title}</div>'
-                f'<div style="font:500 .8rem var(--mono);color:var(--muted)">{sub}</div></div></div></a>'
-            )
-        with st.container(border=True, key="card-feedback"):
-            st.markdown("##### Rate this site")
-            stars = st.feedback("stars", key="stars")
-            if stars is not None:
-                st.caption(["Ouch — tell me what to fix above.", "Noted — thank you.", "Good to know.", "Glad you liked it!", "That made my day."][stars])
-        with st.popover("About this build", icon=":material/info:", width="stretch"):
-            st.markdown(
-                "Built with **Streamlit** — tabs, columns, forms, session state, fragments, dialogs, "
-                "data tables, charts, a sidebar and a custom theme — plus a little CSS/JS for the cursor-reactive background. "
-                "Icons: Devicon & Phosphor. Theme inspired by the manga *Tomodachi Game*; no official art used."
-            )
+
+    # 1 · socials, side by side
+    cols = st.columns(3, gap="medium")
+    for col, (icon, title, sub, href) in zip(cols, [
+        ("envelope-simple", "Email", EMAIL, f"mailto:{EMAIL}"),
+        ("linkedin-logo", "LinkedIn", "in/josephxeno", LINKEDIN),
+        ("github-logo", "GitHub", "X3N0Xeno", GITHUB),
+    ]):
+        col.html(
+            f'<a href="{href}" target="_blank" style="text-decoration:none"><div class="x-card x-tilt x-hot" style="display:flex;align-items:center;gap:1rem">'
+            f'<div style="width:46px;height:46px;flex:none;border-radius:12px;display:grid;place-items:center;background:rgba(var(--accent-rgb),.14);border:1px solid rgba(var(--accent-rgb),.5)">'
+            f'{ic(icon, ACCENT_HEX.lstrip("#"), "")}</div>'
+            f'<div style="min-width:0"><div style="font:700 .98rem var(--body);color:var(--paper)">{title}</div>'
+            f'<div style="font:500 .8rem var(--mono);color:var(--muted);overflow-wrap:anywhere">{sub}</div></div></div></a>'
+        )
+
+    # 2 · deliver a message that was just submitted (runs before the form is drawn,
+    #     so a failed send can put the visitor's text back)
+    pending = ss.pop("contact_pending", None)
+    if pending:
+        try:
+            with st.spinner("Sending your message…"):
+                send_contact_email(pending)
+        except RuntimeError:
+            restore = True
+            ss.contact_error = {
+                "title": "Message not sent",
+                "lead": "The site's mail service isn't set up yet.",
+                "items": [f"Your message is still in the form — you can email me directly at {EMAIL}."],
+            }
+        except Exception:
+            restore = True
+            ss.contact_error = {
+                "title": "Message not sent",
+                "lead": "Something went wrong while sending.",
+                "items": ["Your message is still in the form — please try again in a moment."],
+            }
+        else:
+            restore = False
+            ss.cf_last_sent = time.time()
+            ss.messages.append(pending)
+            st.toast("Message sent — thank you!", icon=":material/mark_email_read:")
+            st.balloons()
+        if restore:
+            ss.cf_name, ss.cf_mail, ss.cf_body = pending["who"], pending["mail"], pending["body"]
+            ss.cf_topic, ss.cf_reply, ss.cf_speed, ss.cf_ok = pending["topic"], pending["reply"], pending["speed"], pending["ok"]
+
+    err = ss.pop("contact_error", None)
+    if err:
+        contact_error_dialog(err)
+
+    # 3 · the form, full width
+    with st.form("contact_form", clear_on_submit=False, border=True):
+        c1, c2 = st.columns(2)
+        c1.text_input("Your name *", placeholder="Ada Lovelace", key="cf_name")
+        c2.text_input("Your email *", placeholder="you@example.com", key="cf_mail")
+        st.selectbox("What's this about?", ["Say hi", "Collaboration / project", "Internship or job", "Feedback on this site", "Question about my work"], key="cf_topic")
+        c3, c4 = st.columns(2)
+        c3.radio("Best way to reply", ["Email", "LinkedIn"], horizontal=True, key="cf_reply")
+        c4.select_slider("How soon?", ["Whenever", "This week", "Soon", "Urgent"], value="This week", key="cf_speed")
+        st.text_area("Message *", height=150, placeholder="What would you like to talk about?", key="cf_body")
+        st.checkbox("It's fine to reply using the details above", key="cf_ok")
+        st.form_submit_button("Send message", type="primary", icon=":material/send:", on_click=submit_contact)
+
+    if ss.messages:
+        m = ss.messages[-1]
+        with st.container(border=True, key="card-receipt"):
+            st.markdown(f"##### Sent — thanks, {m['who'].split()[0]}!")
+            st.caption(f"Topic: {m['topic']} · Reply via {m['reply']} · Speed: {m['speed']}")
+            st.markdown("> " + m["body"].replace("\n", "\n> "))
+            st.caption(f"I'll reply to {m['mail']}.")
+
+    # 4 · rating, below the form
+    with st.container(border=True, key="card-feedback"):
+        st.markdown("##### Rate this site")
+        stars = st.feedback("stars", key="stars")
+        if stars is not None:
+            st.caption(["Ouch — tell me what to fix above.", "Noted — thank you.", "Good to know.", "Glad you liked it!", "That made my day."][stars])
+
+    # 5 · back to the start (+ About this build)
     st.write("")
-    c1, _ = st.columns([1, 2])
-    c1.button("Back to the start", icon=":material/replay:", on_click=jump, args=("prologue",), width="stretch")
+    b1, b2, _ = st.columns([1, 1, 1])
+    b1.button("Back to the start", icon=":material/replay:", on_click=jump, args=("prologue",), width="stretch")
+    with b2.popover("About this build", icon=":material/info:", width="stretch"):
+        st.markdown(
+            "Built with **Streamlit** — tabs, columns, forms, session state, fragments, dialogs, "
+            "data tables, charts, a sidebar and a custom theme — plus a little CSS/JS for the cursor-reactive background. "
+            "Icons: Devicon & Phosphor. Theme inspired by the manga *Tomodachi Game*; no official art used."
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
